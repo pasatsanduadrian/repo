@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use('Agg')  # Use a non-GUI backend for Matplotlib
+matplotlib.use('Agg')  # Backend non-GUI pentru Matplotlib
 
 from flask import Flask, request, render_template_string
 import io
@@ -8,6 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import osmnx as ox
+import contextily as ctx
 from tqdm import tqdm
 import base64
 from datetime import datetime
@@ -15,10 +16,9 @@ from datetime import datetime
 app = Flask(__name__)
 
 ##############################
-# Utility: Rețea stradală pentru pluma
+# Hartă cu străzi + basemap color (pentru primul card)
 ##############################
-
-def generate_street_network_image_local(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+def generate_network_basemap(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
     G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
     node_id = ox.nearest_nodes(G, center_lon, center_lat)
     G_proj = ox.project_graph(G)
@@ -29,7 +29,40 @@ def generate_street_network_image_local(center_lat, center_lon, dist=2500, dxy=1
     size_in_pixels = int((2 * extent_range) / dxy)
     figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
     fig, ax = ox.plot_graph(
-        G_proj, bgcolor='none', edge_color='blue', node_size=0,
+        G_proj, bgcolor='none', edge_color='#003366', node_size=0,
+        edge_linewidth=0.5, show=False, close=False, figsize=figsize
+    )
+    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
+    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
+    # Adaugă basemap color
+    try:
+        ctx.add_basemap(ax, crs=crs_proj, source=ctx.providers.Stamen.Terrain)
+    except Exception:
+        pass
+    fig.tight_layout(pad=0)
+    fig.canvas.draw()
+    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+    # Salvează imaginea ca png
+    path = "/tmp/network_basemap.png"
+    fig.savefig(path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels, path
+
+##############################
+# Hartă doar cu străzi pentru suprapunerea plumei
+##############################
+def generate_network_only(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+    node_id = ox.nearest_nodes(G, center_lon, center_lat)
+    G_proj = ox.project_graph(G)
+    crs_proj = G_proj.graph['crs']
+    emission_source_x = G_proj.nodes[node_id]['x']
+    emission_source_y = G_proj.nodes[node_id]['y']
+    extent_range = dist
+    size_in_pixels = int((2 * extent_range) / dxy)
+    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+    fig, ax = ox.plot_graph(
+        G_proj, bgcolor='white', edge_color='#003366', node_size=0,
         edge_linewidth=0.5, show=False, close=False, figsize=figsize
     )
     ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
@@ -43,7 +76,6 @@ def generate_street_network_image_local(center_lat, center_lon, dist=2500, dxy=1
 ##############################
 # Gaussian Plume & Heatmap
 ##############################
-
 def calc_sigmas(CATEGORY, x1):
     x = np.abs(x1)
     a = np.zeros(np.shape(x))
@@ -51,99 +83,54 @@ def calc_sigmas(CATEGORY, x1):
     c = np.zeros(np.shape(x))
     d = np.zeros(np.shape(x))
     if CATEGORY == 1:
-        ind = np.where((x < 100.) & (x > 0.))
-        a[ind] = 122.800; b[ind] = 0.94470
-        ind = np.where((x >= 100.) & (x < 150.))
-        a[ind] = 158.080; b[ind] = 1.05420
-        ind = np.where((x >= 150.) & (x < 200.))
-        a[ind] = 170.220; b[ind] = 1.09320
-        ind = np.where((x >= 200.) & (x < 250.))
-        a[ind] = 179.520; b[ind] = 1.12620
-        ind = np.where((x >= 250.) & (x < 300.))
-        a[ind] = 217.410; b[ind] = 1.26440
-        ind = np.where((x >= 300.) & (x < 400.))
-        a[ind] = 258.89; b[ind] = 1.40940
-        ind = np.where((x >= 400.) & (x < 500.))
-        a[ind] = 346.75; b[ind] = 1.7283
-        ind = np.where((x >= 500.) & (x < 3110.))
-        a[ind] = 453.85; b[ind] = 2.1166
-        ind = np.where(x >= 3110.)
-        a[ind] = 453.85; b[ind] = 2.1166
-        c[:] = 24.1670
-        d[:] = 2.5334
+        ind = np.where((x < 100.) & (x > 0.)); a[ind] = 122.800; b[ind] = 0.94470
+        ind = np.where((x >= 100.) & (x < 150.)); a[ind] = 158.080; b[ind] = 1.05420
+        ind = np.where((x >= 150.) & (x < 200.)); a[ind] = 170.220; b[ind] = 1.09320
+        ind = np.where((x >= 200.) & (x < 250.)); a[ind] = 179.520; b[ind] = 1.12620
+        ind = np.where((x >= 250.) & (x < 300.)); a[ind] = 217.410; b[ind] = 1.26440
+        ind = np.where((x >= 300.) & (x < 400.)); a[ind] = 258.89; b[ind] = 1.40940
+        ind = np.where((x >= 400.) & (x < 500.)); a[ind] = 346.75; b[ind] = 1.7283
+        ind = np.where((x >= 500.) & (x < 3110.)); a[ind] = 453.85; b[ind] = 2.1166
+        ind = np.where(x >= 3110.); a[ind] = 453.85; b[ind] = 2.1166
+        c[:] = 24.1670; d[:] = 2.5334
     elif CATEGORY == 2:
-        ind = np.where((x < 200.) & (x > 0.))
-        a[ind] = 90.673; b[ind] = 0.93198
-        ind = np.where((x >= 200.) & (x < 400.))
-        a[ind] = 98.483; b[ind] = 0.98332
-        ind = np.where(x >= 400.)
-        a[ind] = 109.3; b[ind] = 1.09710
-        c[:] = 18.3330
-        d[:] = 1.8096
+        ind = np.where((x < 200.) & (x > 0.)); a[ind] = 90.673; b[ind] = 0.93198
+        ind = np.where((x >= 200.) & (x < 400.)); a[ind] = 98.483; b[ind] = 0.98332
+        ind = np.where(x >= 400.); a[ind] = 109.3; b[ind] = 1.09710
+        c[:] = 18.3330; d[:] = 1.8096
     elif CATEGORY == 3:
-        a[:] = 61.141
-        b[:] = 0.91465
-        c[:] = 12.5
-        d[:] = 1.0857
+        a[:] = 61.141; b[:] = 0.91465; c[:] = 12.5; d[:] = 1.0857
     elif CATEGORY == 4:
-        ind = np.where((x < 300.) & (x > 0.))
-        a[ind] = 34.459; b[ind] = 0.86974
-        ind = np.where((x >= 300.) & (x < 1000.))
-        a[ind] = 32.093; b[ind] = 0.81066
-        ind = np.where((x >= 1000.) & (x < 3000.))
-        a[ind] = 32.093; b[ind] = 0.64403
-        ind = np.where((x >= 3000.) & (x < 10000.))
-        a[ind] = 33.504; b[ind] = 0.60486
-        ind = np.where((x >= 10000.) & (x < 30000.))
-        a[ind] = 36.650; b[ind] = 0.56589
-        ind = np.where(x >= 30000.)
-        a[ind] = 44.053; b[ind] = 0.51179
-        c[:] = 8.3330
-        d[:] = 0.72382
+        ind = np.where((x < 300.) & (x > 0.)); a[ind] = 34.459; b[ind] = 0.86974
+        ind = np.where((x >= 300.) & (x < 1000.)); a[ind] = 32.093; b[ind] = 0.81066
+        ind = np.where((x >= 1000.) & (x < 3000.)); a[ind] = 32.093; b[ind] = 0.64403
+        ind = np.where((x >= 3000.) & (x < 10000.)); a[ind] = 33.504; b[ind] = 0.60486
+        ind = np.where((x >= 10000.) & (x < 30000.)); a[ind] = 36.650; b[ind] = 0.56589
+        ind = np.where(x >= 30000.); a[ind] = 44.053; b[ind] = 0.51179
+        c[:] = 8.3330; d[:] = 0.72382
     elif CATEGORY == 5:
-        ind = np.where((x < 100.) & (x > 0.))
-        a[ind] = 24.26; b[ind] = 0.83660
-        ind = np.where((x >= 100.) & (x < 300.))
-        a[ind] = 23.331; b[ind] = 0.81956
-        ind = np.where((x >= 300.) & (x < 1000.))
-        a[ind] = 21.628; b[ind] = 0.75660
-        ind = np.where((x >= 1000.) & (x < 2000.))
-        a[ind] = 21.628; b[ind] = 0.63077
-        ind = np.where((x >= 2000.) & (x < 4000.))
-        a[ind] = 22.534; b[ind] = 0.57154
-        ind = np.where((x >= 4000.) & (x < 10000.))
-        a[ind] = 24.703; b[ind] = 0.50527
-        ind = np.where((x >= 10000.) & (x < 20000.))
-        a[ind] = 26.970; b[ind] = 0.46713
-        ind = np.where((x >= 20000.) & (x < 40000.))
-        a[ind] = 35.420; b[ind] = 0.37615
-        ind = np.where(x >= 40000.)
-        a[ind] = 47.618; b[ind] = 0.29592
-        c[:] = 6.25
-        d[:] = 0.54287
+        ind = np.where((x < 100.) & (x > 0.)); a[ind] = 24.26; b[ind] = 0.83660
+        ind = np.where((x >= 100.) & (x < 300.)); a[ind] = 23.331; b[ind] = 0.81956
+        ind = np.where((x >= 300.) & (x < 1000.)); a[ind] = 21.628; b[ind] = 0.75660
+        ind = np.where((x >= 1000.) & (x < 2000.)); a[ind] = 21.628; b[ind] = 0.63077
+        ind = np.where((x >= 2000.) & (x < 4000.)); a[ind] = 22.534; b[ind] = 0.57154
+        ind = np.where((x >= 4000.) & (x < 10000.)); a[ind] = 24.703; b[ind] = 0.50527
+        ind = np.where((x >= 10000.) & (x < 20000.)); a[ind] = 26.970; b[ind] = 0.46713
+        ind = np.where((x >= 20000.) & (x < 40000.)); a[ind] = 35.420; b[ind] = 0.37615
+        ind = np.where(x >= 40000.); a[ind] = 47.618; b[ind] = 0.29592
+        c[:] = 6.25; d[:] = 0.54287
     elif CATEGORY == 6:
-        ind = np.where((x < 200.) & (x > 0.))
-        a[ind] = 15.209; b[ind] = 0.81558
-        ind = np.where((x >= 200.) & (x < 700.))
-        a[ind] = 14.457; b[ind] = 0.78407
-        ind = np.where((x >= 700.) & (x < 1000.))
-        a[ind] = 13.953; b[ind] = 0.68465
-        ind = np.where((x >= 1000.) & (x < 2000.))
-        a[ind] = 13.953; b[ind] = 0.63227
-        ind = np.where((x >= 2000.) & (x < 3000.))
-        a[ind] = 14.823; b[ind] = 0.54503
-        ind = np.where((x >= 3000.) & (x < 7000.))
-        a[ind] = 16.187; b[ind] = 0.46490
-        ind = np.where((x >= 7000.) & (x < 15000.))
-        a[ind] = 17.836; b[ind] = 0.41507
-        ind = np.where((x >= 15000.) & (x < 30000.))
-        a[ind] = 22.651; b[ind] = 0.32681
-        ind = np.where((x >= 30000.) & (x < 60000.))
-        a[ind] = 27.074; b[ind] = 0.27436
-        ind = np.where(x >= 60000.)
-        a[ind] = 34.219; b[ind] = 0.21716
-        c[:] = 4.1667
-        d[:] = 0.36191
+        ind = np.where((x < 200.) & (x > 0.)); a[ind] = 15.209; b[ind] = 0.81558
+        ind = np.where((x >= 200.) & (x < 700.)); a[ind] = 14.457; b[ind] = 0.78407
+        ind = np.where((x >= 700.) & (x < 1000.)); a[ind] = 13.953; b[ind] = 0.68465
+        ind = np.where((x >= 1000.) & (x < 2000.)); a[ind] = 13.953; b[ind] = 0.63227
+        ind = np.where((x >= 2000.) & (x < 3000.)); a[ind] = 14.823; b[ind] = 0.54503
+        ind = np.where((x >= 3000.) & (x < 7000.)); a[ind] = 16.187; b[ind] = 0.46490
+        ind = np.where((x >= 7000.) & (x < 15000.)); a[ind] = 17.836; b[ind] = 0.41507
+        ind = np.where((x >= 15000.) & (x < 30000.)); a[ind] = 22.651; b[ind] = 0.32681
+        ind = np.where((x >= 30000.) & (x < 60000.)); a[ind] = 27.074; b[ind] = 0.27436
+        ind = np.where(x >= 60000.); a[ind] = 34.219; b[ind] = 0.21716
+        c[:] = 4.1667; d[:] = 0.36191
     else:
         raise ValueError("Unknown stability category.")
     sig_z = a * (x / 1000.)**b
@@ -180,20 +167,13 @@ def calculate_plume_rise(T_stack, T_ambient, wind_speed, flow_rate, stack_diamet
     return delta_H
 
 def estimate_stability(row):
-    if row['WS'] > 4.5:
-        return 6
-    elif row['WS'] > 3.5:
-        return 5
-    elif row['RAD'] > 200 and row['TC'] > 20:
-        return 4
-    elif row['RAD'] > 120 and row['TC'] > 15:
-        return 3
-    elif row['RAD'] > 50:
-        return 2
-    elif row['RH'] > 75:
-        return 1
-    else:
-        return 1
+    if row['WS'] > 4.5: return 6
+    elif row['WS'] > 3.5: return 5
+    elif row['RAD'] > 200 and row['TC'] > 20: return 4
+    elif row['RAD'] > 120 and row['TC'] > 15: return 3
+    elif row['RAD'] > 50: return 2
+    elif row['RH'] > 75: return 1
+    else: return 1
 
 def overlay_on_map(local_x, local_y, C1, image_data, extent_range):
     fig = plt.figure(figsize=(8, 8))
@@ -226,6 +206,7 @@ def overlay_on_map(local_x, local_y, C1, image_data, extent_range):
     ax.set_title('Dispersion Plume Overlaid on Local Street Map')
     ax.legend(loc='upper right')
     fig.tight_layout()
+    # Return also C1_max, min/max values for metadate
     return fig, C1_max, min_val, max_val
 
 def run_dispersion_model_local(center_lon, center_lat, street_network_image,
@@ -266,50 +247,63 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
     fig_overlay, C1_max, min_conc, max_conc = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
     return fig_overlay, min_conc, max_conc
 
-##################################
+# --------------------------
 # Flask Routes & Interface
-##################################
+# --------------------------
 
 form_template = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ro">
 <head>
   <meta charset="UTF-8">
-  <title>Pollutant Dispersion Simulation</title>
+  <title>Simulare dispersie poluanți — Vizualizare pe hartă</title>
   <style>
-    body { font-family: Arial, sans-serif; background: #f7f7fa; }
-    .main-card { max-width: 800px; margin: 20px auto; background: #fff; border-radius: 14px; box-shadow: 0 4px 12px #0001; padding: 32px; }
-    h2, h3 { color: #2659a6; margin-top: 0;}
-    label { font-weight: bold; }
-    input[type="text"] { padding: 4px 10px; border-radius: 6px; border: 1px solid #aaa; margin-bottom: 12px; width: 180px;}
-    input[type="submit"] { background: #2659a6; color: #fff; border: none; padding: 7px 24px; border-radius: 6px; font-weight: 600;}
-    ul { line-height: 1.7; }
-    img { border-radius: 10px; border: 1px solid #ccc; margin-bottom: 15px; }
-    .meta-list li { margin-bottom: 5px; }
-    .back-link { margin-top: 24px; display: inline-block; text-decoration: none; color: #2659a6;}
-    .back-link:hover { text-decoration: underline;}
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f6f8fb; margin:0; padding:0; }
+    .container { max-width: 960px; margin:40px auto 40px auto; background:#fff; border-radius:18px; box-shadow:0 2px 24px #00244422; padding: 36px 28px; }
+    h1, h2, h3 { color: #003366; }
+    label { font-weight:bold; margin-top: 8px;}
+    input[type="text"] { padding:6px; border-radius:6px; border:1px solid #ddd; width:120px; margin-bottom: 12px;}
+    .btn { background: #0066cc; color: #fff; border:none; border-radius:6px; padding: 8px 20px; cursor:pointer; font-size:16px; }
+    .cards { display: flex; gap:32px; flex-wrap:wrap; margin-top:24px; }
+    .card { background:#f7faff; border-radius:14px; box-shadow:0 1px 8px #0050a111; padding:18px; flex:1 1 320px; min-width:280px; }
+    img { width:100%; max-width: 480px; border-radius:8px; border:1.5px solid #e0e0e0; box-shadow: 0 1px 6px #00447722;}
+    table { width:100%; margin-top: 14px;}
+    th, td { text-align:left; padding:6px 12px;}
+    th { background:#eaf4fc;}
+    tr:nth-child(even){background-color: #f2f9fe;}
+    .backlink { display:block; margin-top:18px; font-size:15px; color: #0366d6;}
+    @media (max-width:900px) { .cards{flex-direction:column; gap:18px;} }
+    .osm-note { margin:10px 0 18px 0; color:#333;}
   </style>
 </head>
 <body>
-<div class="main-card">
-  <h2>Simulare dispersie poluant pe hartă stradală</h2>
-  <form method="post" action="/simulate">
-    <label>Latitudine centru:</label><br>
-    <input type="text" name="latitude" value="44.4399"><br>
-    <label>Longitudine centru:</label><br>
-    <input type="text" name="longitude" value="26.0550"><br>
-    <label>Rază analiză (m):</label><br>
-    <input type="text" name="radius" value="2500"><br>
-    <h3>Parametri emisie</h3>
-    <label>Flow Rate (m³/s):</label><br>
-    <input type="text" name="flow_rate" value="5"><br>
-    <label>Înălțime sursă (H în m):</label><br>
-    <input type="text" name="H" value="25"><br>
-    <label>Temperatură gaze (T_stack în °C):</label><br>
-    <input type="text" name="T_stack" value="150"><br>
-    <input type="submit" value="Simulează">
-  </form>
-</div>
+  <div class="container">
+    <h1>🛰️ Simulare dispersie poluanți</h1>
+    <p>Generează rapid o simulare și vizualizează rezultatul pe hartă cu străzi și suprapunerea plumei de poluare.</p>
+    <div class="osm-note">
+      <b>Consultă harta:</b>
+      <a href="https://www.openstreetmap.org/search?query=strada%20mosoaia%2037%2C%20bucuresti#map=19/44.379146/26.130614"
+         target="_blank" style="color:#0366d6; text-decoration:underline;">
+         Deschide OpenStreetMap (pentru identificare coordonate)
+      </a>
+      <br/>Copiezi coordonatele în câmpurile de mai jos.
+    </div>
+    <form method="post" action="/simulate">
+      <label>Latitudine centru:</label><br>
+      <input type="text" name="latitude" value="44.4399"><br>
+      <label>Longitudine centru:</label><br>
+      <input type="text" name="longitude" value="26.0550"><br>
+      <label>Rază analiză (m):</label><br>
+      <input type="text" name="radius" value="2500"><br>
+      <label>Debit (flow rate, m³/s):</label><br>
+      <input type="text" name="flow_rate" value="5"><br>
+      <label>Înălțime sursă (H, m):</label><br>
+      <input type="text" name="H" value="25"><br>
+      <label>Temperatură gaze (°C):</label><br>
+      <input type="text" name="T_stack" value="150"><br><br>
+      <input class="btn" type="submit" value="Rulează simularea">
+    </form>
+  </div>
 </body>
 </html>
 """
@@ -330,10 +324,16 @@ def simulate():
         dxy = 10
         dpi = 100
 
-        # 1. Imagine rețea stradală
-        street_network_image, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels = generate_street_network_image_local(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
+        # Card 1: hartă rețea stradală + basemap color
+        network_img, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels, network_path = generate_network_basemap(
+            latitude, longitude, dist=radius, dxy=dxy, dpi=dpi
+        )
+        # Card 2: hartă doar cu străzi pentru pluma
+        street_network_image, _, _, _, _, _ = generate_network_only(
+            latitude, longitude, dist=radius, dxy=dxy, dpi=dpi
+        )
 
-        # 2. Pluma pe rețea stradală
+        # Rulează modelul și plotează pluma DOAR pe străzi (fără basemap color)
         fig_overlay, min_conc, max_conc = run_dispersion_model_local(
             longitude, latitude, street_network_image,
             emission_source_x, emission_source_y, flow_rate, H, T_stack, crs_proj, extent_range, size_in_pixels
@@ -342,39 +342,91 @@ def simulate():
         fig_overlay.savefig(overlay_path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
         plt.close(fig_overlay)
 
-        # Encode pentru HTML inline
+        # Imagini base64 pentru embed + url local pentru click/zoom
+        with open(network_path, "rb") as imgfile:
+            network_bytes = imgfile.read()
         with open(overlay_path, "rb") as imgfile:
-            overlay_b64 = base64.b64encode(imgfile.read()).decode()
+            overlay_bytes = imgfile.read()
 
-        # Metadate simulare
-        metadate = {
-            "Data generării": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "Coordonate centru": f"({latitude}, {longitude})",
-            "Rază analiză": f"{radius} m",
-            "Flow rate": f"{flow_rate} m³/s",
-            "Înălțime sursă": f"{H} m",
-            "Temperatură gaze": f"{T_stack} °C",
-            "Grid step": f"{dxy} m",
-            "Emission source (x,y)": f"({emission_source_x:.2f}, {emission_source_y:.2f})",
-            "Max conc": f"{max_conc:.4f} μg/m³",
-            "Min conc (>0)": f"{min_conc:.4f} μg/m³"
-        }
+        network_b64 = base64.b64encode(network_bytes).decode()
+        overlay_b64 = base64.b64encode(overlay_bytes).decode()
+
+        # Metadate tabelar
+        metadate = [
+            ("Data generării", datetime.now().strftime("%d/%m/%Y %H:%M")),
+            ("Coordonate centru", f"{latitude}, {longitude}"),
+            ("Rază analiză", f"{radius} m"),
+            ("Flow rate", f"{flow_rate} m³/s"),
+            ("Înălțime sursă", f"{H} m"),
+            ("Temperatură gaze", f"{T_stack} °C"),
+            ("Grid step", f"{dxy} m"),
+            ("Emission source (x, y)", f"{emission_source_x:.2f}, {emission_source_y:.2f}"),
+            ("Max conc", f"{max_conc:.2f} μg/m³"),
+            ("Min conc (>0)", f"{min_conc:.2f} μg/m³")
+        ]
 
         html = f"""
-        <div class="main-card">
-        <h2>Rezultat simulare dispersie pe hartă stradală</h2>
-        <img src='data:image/png;base64,{overlay_b64}' style='max-width:520px;'/><br>
-        <h3>Metadate simulare</h3>
-        <ul class="meta-list">
-        {''.join([f'<li><b>{k}</b>: {v}</li>' for k, v in metadate.items()])}
-        </ul>
-        <a href='/' class='back-link'>&larr; Înapoi la simulare</a>
+        <div class="container">
+          <h1>🛰️ Rezultat simulare dispersie</h1>
+          <div class="cards">
+            <div class="card">
+              <h2>Hartă rețea stradală cu basemap</h2>
+              <a href="/image/network" target="_blank" title="Deschide imagine completă">
+                <img src='data:image/png;base64,{network_b64}' alt="Basemap"/>
+              </a>
+            </div>
+            <div class="card">
+              <h2>Plume suprapus pe rețea stradală</h2>
+              <a href="/image/overlay" target="_blank" title="Deschide imagine completă">
+                <img src='data:image/png;base64,{overlay_b64}' alt="Overlay"/>
+              </a>
+            </div>
+          </div>
+          <div class="card" style="margin-top:32px;">
+            <h3>Metadate simulare</h3>
+            <table>
+              <tbody>
+                {''.join([f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in metadate])}
+              </tbody>
+            </table>
+          </div>
+          <a class="backlink" href='/'>⟵ Înapoi la simulare</a>
         </div>
+        <style>
+            {form_template.split("<style>")[1].split("</style>")[0]}
+        </style>
+        """
+        # Salvează și pentru acces la imagine full
+        with open("/tmp/last_network.png", "wb") as f:
+            f.write(network_bytes)
+        with open("/tmp/last_overlay.png", "wb") as f:
+            f.write(overlay_bytes)
+
+        return render_template_string(html)
+    except Exception as e:
+        html = f"""
+        <div class="container">
+            <h2 style="color:#a00;">Eroare la simulare</h2>
+            <div class="card" style="background:#ffebee;color:#a00;">
+              <b>{str(e)}</b>
+            </div>
+            <a class="backlink" href='/'>⟵ Înapoi la simulare</a>
+        </div>
+        <style>
+            {form_template.split("<style>")[1].split("</style>")[0]}
+        </style>
         """
         return render_template_string(html)
 
-    except Exception as e:
-        return f"Eroare la simulare: {str(e)}"
+# Rute pentru imagini mari (click zoom)
+from flask import send_file
+@app.route("/image/network")
+def img_network():
+    return send_file("/tmp/last_network.png", mimetype="image/png")
+
+@app.route("/image/overlay")
+def img_overlay():
+    return send_file("/tmp/last_overlay.png", mimetype="image/png")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5003, debug=True)
