@@ -15,36 +15,33 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-##############################
-# Utility: Basemap with străzi
-##############################
-
 def generate_basemap_image(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
     G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
-    size_in_pixels = 2*dist / dxy
+    size_in_pixels = int(2*dist / dxy)
     figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
     fig, ax = ox.plot_graph(
-        G, bgcolor='none', edge_color='blue', node_size=0, edge_linewidth=0.5,
+        G, bgcolor='none', edge_color='#003366', node_size=0, edge_linewidth=0.5,
         show=False, close=False, figsize=figsize
     )
-    ax.set_xlim([center_lon - 0.025, center_lon + 0.025])
-    ax.set_ylim([center_lat - 0.018, center_lat + 0.018])
-    ctx.add_basemap(ax, crs="EPSG:4326")
+    # Folosește coordonate proiectate pentru a evita distorsiuni
+    G_proj = ox.project_graph(G)
+    bounds = ox.utils_graph.graph_to_gdfs(G_proj, nodes=False, edges=True).total_bounds
+    ax.set_xlim(bounds[0], bounds[2])
+    ax.set_ylim(bounds[1], bounds[3])
+    ctx.add_basemap(ax, crs=G_proj.graph['crs'])
     fig.canvas.draw()
     image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
     plt.tight_layout(pad=0)
     img_path = "/tmp/basemap.png"
     plt.savefig(img_path, bbox_inches='tight', pad_inches=0, dpi=dpi)
     plt.close(fig)
-    # Find emission source
+    # Find emission source projected
+    nodes_proj = ox.project_graph(G)
     nearest_node = ox.nearest_nodes(G, center_lon, center_lat)
-    emission_source_x = G.nodes[nearest_node]['x']
-    emission_source_y = G.nodes[nearest_node]['y']
-    return img_path, image_array, emission_source_x, emission_source_y
-
-##############################
-# Gaussian Plume & Heatmap
-##############################
+    nearest_node_proj = ox.nearest_nodes(nodes_proj, center_lon, center_lat)
+    emission_source_x = nodes_proj.nodes[nearest_node_proj]['x']
+    emission_source_y = nodes_proj.nodes[nearest_node_proj]['y']
+    return img_path, image_array, emission_source_x, emission_source_y, nodes_proj
 
 def calc_sigmas(CATEGORY, x1):
     x = np.abs(x1)
@@ -268,35 +265,50 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
     fig_overlay, C1_max, min_conc, max_conc = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
     return fig_overlay, min_conc, max_conc
 
-##################################
-# Flask Routes & Interface
-##################################
-
 form_template = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ro">
 <head>
   <meta charset="UTF-8">
-  <title>Pollutant Dispersion Simulation</title>
+  <title>Simulare dispersie poluanți — Vizualizare pe hartă</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f6f8fb; margin:0; padding:0; }
+    .container { max-width: 960px; margin:40px auto 40px auto; background:#fff; border-radius:18px; box-shadow:0 2px 24px #00244422; padding: 36px 28px; }
+    h1, h2, h3 { color: #003366; }
+    label { font-weight:bold; margin-top: 8px;}
+    input[type="text"] { padding:6px; border-radius:6px; border:1px solid #ddd; width:120px; margin-bottom: 12px;}
+    .btn { background: #0066cc; color: #fff; border:none; border-radius:6px; padding: 8px 20px; cursor:pointer; font-size:16px; }
+    .cards { display: flex; gap:32px; flex-wrap:wrap; margin-top:24px; }
+    .card { background:#f7faff; border-radius:14px; box-shadow:0 1px 8px #0050a111; padding:18px; flex:1 1 320px; min-width:280px; }
+    img { width:100%; max-width: 480px; border-radius:8px; border:1.5px solid #e0e0e0; box-shadow: 0 1px 6px #00447722;}
+    table { width:100%; margin-top: 14px;}
+    th, td { text-align:left; padding:6px 12px;}
+    th { background:#eaf4fc;}
+    tr:nth-child(even){background-color: #f2f9fe;}
+    .backlink { display:block; margin-top:18px; font-size:15px; color: #0366d6;}
+    @media (max-width:900px) { .cards{flex-direction:column; gap:18px;} }
+  </style>
 </head>
 <body>
-  <h2>Enter Input Parameters</h2>
-  <form method="post" action="/simulate">
-    <label>Center Latitude:</label><br>
-    <input type="text" name="latitude" value="44.4399"><br><br>
-    <label>Center Longitude:</label><br>
-    <input type="text" name="longitude" value="26.0550"><br><br>
-    <label>Interest Radius (m):</label><br>
-    <input type="text" name="radius" value="2500"><br><br>
-    <h3>Emission Parameters</h3>
-    <label>Flow Rate (m³/s):</label><br>
-    <input type="text" name="flow_rate" value="5"><br><br>
-    <label>Source Height (H in m):</label><br>
-    <input type="text" name="H" value="25"><br><br>
-    <label>Stack Gas Temperature (T_stack in °C):</label><br>
-    <input type="text" name="T_stack" value="150"><br><br>
-    <input type="submit" value="Run Simulation">
-  </form>
+  <div class="container">
+    <h1>🛰️ Simulare dispersie poluanți</h1>
+    <p>Generează rapid o simulare și vizualizează rezultatul pe hartă cu străzi și suprapunerea plumei de poluare.</p>
+    <form method="post" action="/simulate">
+      <label>Latitudine centru:</label><br>
+      <input type="text" name="latitude" value="44.4399"><br>
+      <label>Longitudine centru:</label><br>
+      <input type="text" name="longitude" value="26.0550"><br>
+      <label>Rază analiză (m):</label><br>
+      <input type="text" name="radius" value="2500"><br>
+      <label>Debit (flow rate, m³/s):</label><br>
+      <input type="text" name="flow_rate" value="5"><br>
+      <label>Înălțime sursă (H, m):</label><br>
+      <input type="text" name="H" value="25"><br>
+      <label>Temperatură gaze (°C):</label><br>
+      <input type="text" name="T_stack" value="150"><br><br>
+      <input class="btn" type="submit" value="Rulează simularea">
+    </form>
+  </div>
 </body>
 </html>
 """
@@ -317,15 +329,12 @@ def simulate():
         dxy = 10
         dpi = 100
 
-        # 1. Generate basemap image
-        basemap_path, basemap_img, emission_source_x, emission_source_y = generate_basemap_image(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
+        # 1. Basemap
+        basemap_path, basemap_img, emission_source_x, emission_source_y, G_proj = generate_basemap_image(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
 
-        # 2. Generate street network image (array)
-        # For overlay plume, reuse basemap_img and emission_source
+        # 2. Plume overlay
         extent_range = radius
         size_in_pixels = int((2 * extent_range) / dxy)
-
-        # 3. Run plume model and overlay
         fig_overlay, min_conc, max_conc = run_dispersion_model_local(
             longitude, latitude, basemap_img,
             emission_source_x, emission_source_y, flow_rate, H, T_stack, None, extent_range, size_in_pixels
@@ -334,43 +343,68 @@ def simulate():
         fig_overlay.savefig(overlay_path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
         plt.close(fig_overlay)
 
-        # Encode images for inline display
+        # Encode images
         def encode_img(path):
             with open(path, "rb") as imgfile:
                 return base64.b64encode(imgfile.read()).decode()
         basemap_b64 = encode_img(basemap_path)
         overlay_b64 = encode_img(overlay_path)
 
-        # Metadate
-        metadate = {
-            "Data generării": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "Coordonate centru": f"({latitude}, {longitude})",
-            "Rază analiză": f"{radius} m",
-            "Flow rate": f"{flow_rate} m³/s",
-            "Înălțime sursă": f"{H} m",
-            "Temperatură gaze": f"{T_stack} °C",
-            "Grid step": f"{dxy} m",
-            "Emission source (x,y)": f"({emission_source_x:.2f}, {emission_source_y:.2f})",
-            "Max conc": f"{max_conc:.2f} μg/m³",
-            "Min conc (>0)": f"{min_conc:.2f} μg/m³"
-        }
+        metadate = [
+            ("Data generării", datetime.now().strftime("%d/%m/%Y %H:%M")),
+            ("Coordonate centru", f"{latitude}, {longitude}"),
+            ("Rază analiză", f"{radius} m"),
+            ("Debit (flow rate)", f"{flow_rate} m³/s"),
+            ("Înălțime sursă", f"{H} m"),
+            ("Temperatură gaze", f"{T_stack} °C"),
+            ("Grid step", f"{dxy} m"),
+            ("Emission source (x, y)", f"{emission_source_x:.2f}, {emission_source_y:.2f}"),
+            ("Max conc", f"{max_conc:.2f} μg/m³"),
+            ("Min conc (>0)", f"{min_conc:.2f} μg/m³")
+        ]
 
         html = f"""
-        <h2>Rezultat simulare dispersie</h2>
-        <b>Basemap + rețea stradală</b><br>
-        <img src='data:image/png;base64,{basemap_b64}' style='max-width:480px;'/><br>
-        <b>Plume suprapus pe hartă</b><br>
-        <img src='data:image/png;base64,{overlay_b64}' style='max-width:480px;'/><br>
-        <h3>Metadate simulare</h3>
-        <ul>
-        {''.join([f'<li><b>{k}</b>: {v}</li>' for k, v in metadate.items()])}
-        </ul>
-        <a href='/'>⟵ Înapoi la simulare</a>
+        <div class="container">
+          <h1>🛰️ Rezultat simulare dispersie</h1>
+          <div class="cards">
+            <div class="card">
+              <h2>Hartă rețea stradală (basemap)</h2>
+              <img src='data:image/png;base64,{basemap_b64}' alt="Basemap"/>
+            </div>
+            <div class="card">
+              <h2>Plume suprapus pe hartă</h2>
+              <img src='data:image/png;base64,{overlay_b64}' alt="Overlay"/>
+            </div>
+          </div>
+          <div class="card" style="margin-top:32px;">
+            <h3>Metadate simulare</h3>
+            <table>
+              <tbody>
+                {''.join([f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in metadate])}
+              </tbody>
+            </table>
+          </div>
+          <a class="backlink" href='/'>⟵ Înapoi la simulare</a>
+        </div>
+        <style>
+            {form_template.split("<style>")[1].split("</style>")[0]}
+        </style>
         """
         return render_template_string(html)
-
     except Exception as e:
-        return f"Error during simulation: {str(e)}"
+        html = f"""
+        <div class="container">
+            <h2 style="color:#a00;">Eroare la simulare</h2>
+            <div class="card" style="background:#ffebee;color:#a00;">
+              <b>{str(e)}</b>
+            </div>
+            <a class="backlink" href='/'>⟵ Înapoi la simulare</a>
+        </div>
+        <style>
+            {form_template.split("<style>")[1].split("</style>")[0]}
+        </style>
+        """
+        return render_template_string(html)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5003, debug=True)
