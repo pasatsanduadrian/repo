@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use('Agg')  # Use a non-GUI backend for Matplotlib
+matplotlib.use('Agg')  # Folosește backend non-GUI pentru Matplotlib
 
 from flask import Flask, request, render_template_string
 import io
@@ -15,33 +15,36 @@ from datetime import datetime
 
 app = Flask(__name__)
 
+##############################
+# Utility: Basemap cu străzi
+##############################
+
 def generate_basemap_image(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
     G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
-    size_in_pixels = int(2*dist / dxy)
+    size_in_pixels = 2*dist / dxy
     figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
     fig, ax = ox.plot_graph(
         G, bgcolor='none', edge_color='#003366', node_size=0, edge_linewidth=0.5,
         show=False, close=False, figsize=figsize
     )
-    # Folosește coordonate proiectate pentru a evita distorsiuni
-    G_proj = ox.project_graph(G)
-    bounds = ox.utils_graph.graph_to_gdfs(G_proj, nodes=False, edges=True).total_bounds
-    ax.set_xlim(bounds[0], bounds[2])
-    ax.set_ylim(bounds[1], bounds[3])
-    ctx.add_basemap(ax, crs=G_proj.graph['crs'])
+    ax.set_xlim([center_lon - 0.025, center_lon + 0.025])
+    ax.set_ylim([center_lat - 0.018, center_lat + 0.018])
+    ctx.add_basemap(ax, crs="EPSG:4326")
     fig.canvas.draw()
     image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
     plt.tight_layout(pad=0)
     img_path = "/tmp/basemap.png"
     plt.savefig(img_path, bbox_inches='tight', pad_inches=0, dpi=dpi)
     plt.close(fig)
-    # Find emission source projected
-    nodes_proj = ox.project_graph(G)
+    # Find emission source
     nearest_node = ox.nearest_nodes(G, center_lon, center_lat)
-    nearest_node_proj = ox.nearest_nodes(nodes_proj, center_lon, center_lat)
-    emission_source_x = nodes_proj.nodes[nearest_node_proj]['x']
-    emission_source_y = nodes_proj.nodes[nearest_node_proj]['y']
-    return img_path, image_array, emission_source_x, emission_source_y, nodes_proj
+    emission_source_x = G.nodes[nearest_node]['x']
+    emission_source_y = G.nodes[nearest_node]['y']
+    return img_path, image_array, emission_source_x, emission_source_y
+
+##############################
+# Gaussian Plume & Heatmap
+##############################
 
 def calc_sigmas(CATEGORY, x1):
     x = np.abs(x1)
@@ -265,6 +268,10 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
     fig_overlay, C1_max, min_conc, max_conc = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
     return fig_overlay, min_conc, max_conc
 
+##################################
+# Flask Routes & Interface
+##################################
+
 form_template = """
 <!DOCTYPE html>
 <html lang="ro">
@@ -329,12 +336,14 @@ def simulate():
         dxy = 10
         dpi = 100
 
-        # 1. Basemap
-        basemap_path, basemap_img, emission_source_x, emission_source_y, G_proj = generate_basemap_image(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
+        # 1. Generate basemap image
+        basemap_path, basemap_img, emission_source_x, emission_source_y = generate_basemap_image(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
 
-        # 2. Plume overlay
+        # 2. Generate street network image (array)
         extent_range = radius
         size_in_pixels = int((2 * extent_range) / dxy)
+
+        # 3. Run plume model and overlay
         fig_overlay, min_conc, max_conc = run_dispersion_model_local(
             longitude, latitude, basemap_img,
             emission_source_x, emission_source_y, flow_rate, H, T_stack, None, extent_range, size_in_pixels
@@ -343,18 +352,19 @@ def simulate():
         fig_overlay.savefig(overlay_path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
         plt.close(fig_overlay)
 
-        # Encode images
+        # Encode images for inline display
         def encode_img(path):
             with open(path, "rb") as imgfile:
                 return base64.b64encode(imgfile.read()).decode()
         basemap_b64 = encode_img(basemap_path)
         overlay_b64 = encode_img(overlay_path)
 
+        # Metadate tabelar
         metadate = [
             ("Data generării", datetime.now().strftime("%d/%m/%Y %H:%M")),
             ("Coordonate centru", f"{latitude}, {longitude}"),
             ("Rază analiză", f"{radius} m"),
-            ("Debit (flow rate)", f"{flow_rate} m³/s"),
+            ("Flow rate", f"{flow_rate} m³/s"),
             ("Înălțime sursă", f"{H} m"),
             ("Temperatură gaze", f"{T_stack} °C"),
             ("Grid step", f"{dxy} m"),
