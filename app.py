@@ -1,26 +1,49 @@
 import matplotlib
 matplotlib.use('Agg')  # Use a non-GUI backend for Matplotlib
 
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string
 import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.patheffects import withStroke
-from matplotlib.patches import FancyArrowPatch
 import osmnx as ox
 import contextily as ctx
 from tqdm import tqdm
-import pyproj
-from shapely.ops import transform
-import shapely.geometry
+import base64
+from datetime import datetime
 
-# Configure Flask
 app = Flask(__name__)
 
 ##############################
-# Utility Functions
+# Utility: Basemap with străzi
+##############################
+
+def generate_basemap_image(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+    size_in_pixels = 2*dist / dxy
+    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+    fig, ax = ox.plot_graph(
+        G, bgcolor='none', edge_color='blue', node_size=0, edge_linewidth=0.5,
+        show=False, close=False, figsize=figsize
+    )
+    ax.set_xlim([center_lon - 0.025, center_lon + 0.025])
+    ax.set_ylim([center_lat - 0.018, center_lat + 0.018])
+    ctx.add_basemap(ax, crs="EPSG:4326")
+    fig.canvas.draw()
+    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+    plt.tight_layout(pad=0)
+    img_path = "/tmp/basemap.png"
+    plt.savefig(img_path, bbox_inches='tight', pad_inches=0, dpi=dpi)
+    plt.close(fig)
+    # Find emission source
+    nearest_node = ox.nearest_nodes(G, center_lon, center_lat)
+    emission_source_x = G.nodes[nearest_node]['x']
+    emission_source_y = G.nodes[nearest_node]['y']
+    return img_path, image_array, emission_source_x, emission_source_y
+
+##############################
+# Gaussian Plume & Heatmap
 ##############################
 
 def calc_sigmas(CATEGORY, x1):
@@ -175,113 +198,45 @@ def estimate_stability(row):
         return 1
 
 def overlay_on_map(local_x, local_y, C1, image_data, extent_range):
-    """
-    Plot the street map and the dispersion plume using *local* coordinates
-    where the emission source is at (0,0) and the extent is [-extent_range, extent_range].
-    """
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111)
-
-    # Define the local extent
     local_extent = [-extent_range, extent_range, -extent_range, extent_range]
-
-    # Plot the base map image using the local extent
     ax.imshow(image_data, extent=local_extent, origin='lower', alpha=1.0)
-
-    # Plot the dispersion concentration
     C1_max = np.max(C1, axis=2) * 1e6
-    # Ensure C1_max has finite values where calculations are valid, replace NaNs if necessary for contouring
-    C1_max = np.nan_to_num(C1_max) 
+    C1_max = np.nan_to_num(C1_max)
     max_val = np.max(C1_max)
     min_val = np.min(C1_max[C1_max > 0]) if np.any(C1_max > 0) else 0
     if max_val == min_val:
-        # Handle case with uniform concentration or no plume
-        thresholds = np.linspace(min_val, max_val + 1e-9, 7) # Add small epsilon to avoid single level
+        thresholds = np.linspace(min_val, max_val + 1e-9, 7)
     else:
-        # Define thresholds from min positive value to max value
-        thresholds = np.linspace(min_val, max_val, 7) # Use 7 levels for 6 intervals
-
-    # Ensure thresholds are unique and sorted
+        thresholds = np.linspace(min_val, max_val, 7)
     thresholds = np.unique(thresholds)
-    if len(thresholds) < 2: # Need at least 2 levels for contourf
+    if len(thresholds) < 2:
         thresholds = np.array([min_val, max_val + 1e-9])
-
     cmap = mcolors.ListedColormap(['#edf8fb', '#b2e2e2', '#8cd2c3', '#66c2a4', '#238b45', '#005824'])
-    # Adjust colormap length if number of levels is less than expected
     if len(thresholds) -1 < len(cmap.colors):
         cmap = mcolors.ListedColormap(cmap.colors[:len(thresholds)-1])
-
-    cs = ax.contourf(local_x, local_y, C1_max, levels=thresholds, cmap=cmap, alpha=0.5, extend='neither') # Use extend='neither'
+    cs = ax.contourf(local_x, local_y, C1_max, levels=thresholds, cmap=cmap, alpha=0.5, extend='neither')
     cbar = fig.colorbar(cs, ticks=thresholds)
     cbar.set_label(r'$\mu g / m^{3}$')
-
-    # Clip contours to the axes rectangle patch
-    patch = plt.Rectangle((local_extent[0], local_extent[2]), local_extent[1]-local_extent[0], local_extent[3]-local_extent[2], transform=ax.transData)
-    for collection in cs.collections:
-        collection.set_clip_path(patch)
-
-    # Mark the emission source at (0,0)
     ax.scatter(0, 0, color='red', s=80, edgecolor='k', zorder=5, label='Emission Source')
-
-    # Set axes limits to match the basemap extent exactly
     ax.set_xlim(local_extent[0], local_extent[1])
     ax.set_ylim(local_extent[2], local_extent[3])
-    ax.set_aspect('equal')  # Ensure square pixels
-
+    ax.set_aspect('equal')
     ax.set_xlabel('x (m, local)')
     ax.set_ylabel('y (m, local)')
     ax.set_title('Dispersion Plume Overlaid on Local Street Map')
     ax.legend(loc='upper right')
     fig.tight_layout()
-    return fig
-
-def generate_street_network_image_local(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
-    """
-    Generate the street network image and return the image, emission source coordinates, crs, extent, and image shape.
-    The image and the meshgrid for the plume will use the same extent and resolution.
-    """
-    # Step 1: Get the unprojected graph in lat/lon
-    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
-    # Step 2: Find nearest node in unprojected coordinates using lat/lon
-    node_id = ox.nearest_nodes(G, center_lon, center_lat)
-    # Step 3: Project the graph to EPSG:3857
-    G_proj = ox.project_graph(G)
-    crs_proj = G_proj.graph['crs']
-    # Step 4: Get the emission source coordinates (projected)
-    emission_source_x = G_proj.nodes[node_id]['x']
-    emission_source_y = G_proj.nodes[node_id]['y']
-    print("Emission source (projected):", emission_source_x, emission_source_y)
-
-    # Use the passed-in dist as the display extent
-    extent_range = dist
-    # Calculate the number of pixels based on dist and dxy
-    size_in_pixels = int((2 * extent_range) / dxy)
-    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
-    fig, ax = ox.plot_graph(
-        G_proj, bgcolor='none', edge_color='blue', node_size=0,
-        edge_linewidth=0.5, show=False, close=False, figsize=figsize
-    )
-    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
-    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
-    fig.tight_layout(pad=0)
-    fig.canvas.draw()
-    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
-    plt.close(fig)
-    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels
+    return fig, C1_max, min_val, max_val
 
 def run_dispersion_model_local(center_lon, center_lat, street_network_image,
                                emission_source_x, emission_source_y, flow_rate, H, T_stack, crs_proj, extent_range, size_in_pixels):
-    """
-    Run the plume dispersion model over a meshgrid defined over the same extent and shape as the map image.
-    """
-    # Create meshgrid in projected coordinates matching the basemap image
     x_range = np.linspace(emission_source_x - extent_range, emission_source_x + extent_range, size_in_pixels)
     y_range = np.linspace(emission_source_y - extent_range, emission_source_y + extent_range, size_in_pixels)
     x, y = np.meshgrid(x_range, y_range)
     local_x = x - emission_source_x
     local_y = y - emission_source_y
-
-    # Test DataFrame for 24 hours of meteorological data
     data = {
         "Time": pd.date_range("2023-07-17 00:00", periods=24, freq='H'),
         "RH": [65.68, 70, 72.73, 75.07, 69.47, 58.89, 51.1, 46.44, 41.02, 35.76, 33.26, 32.76, 32.17, 31.73, 32.69, 34.06, 35.27, 39.56, 45.95, 46.25, 52.12, 54.68, 57.32, 58.74],
@@ -294,10 +249,8 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
     df = pd.DataFrame(data)
     df['Stability'] = df.apply(estimate_stability, axis=1)
     df['Q'] = df['S1'] / 1e6
-
     y_dim, x_dim = x.shape
     C1 = np.zeros((y_dim, x_dim, 24))
-
     for i in tqdm(range(24), desc="Simulating dispersion"):
         wind_dir = df.loc[i, 'WD']
         wind_speed = df.loc[i, 'WS']
@@ -312,9 +265,8 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
         )
         C[mask] = np.nan
         C1[:, :, i] = C
-
-    fig_overlay = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
-    return fig_overlay
+    fig_overlay, C1_max, min_conc, max_conc = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
+    return fig_overlay, min_conc, max_conc
 
 ##################################
 # Flask Routes & Interface
@@ -362,22 +314,63 @@ def simulate():
         flow_rate = float(request.form.get("flow_rate", 5))
         H = float(request.form.get("H", 25))
         T_stack = float(request.form.get("T_stack", 150))
-        dxy = 10  # Use the same grid step as in the notebook
-        
-        # Generate the street network image and determine emission source in projected coordinates
-        street_network_image, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels = generate_street_network_image_local(latitude, longitude, dist=radius, dxy=dxy)
-        
-        # Run the dispersion model and shift coordinates to a local coordinate system (emission source at (0, 0))
-        fig_overlay = run_dispersion_model_local(longitude, latitude, street_network_image,
-                                                   emission_source_x, emission_source_y, flow_rate, H, T_stack, crs_proj, extent_range, size_in_pixels)
-        
-        buf = io.BytesIO()
-        fig_overlay.savefig(buf, format='png', dpi=100, bbox_inches='tight', pad_inches=0)
-        buf.seek(0)
+        dxy = 10
+        dpi = 100
+
+        # 1. Generate basemap image
+        basemap_path, basemap_img, emission_source_x, emission_source_y = generate_basemap_image(latitude, longitude, dist=radius, dxy=dxy, dpi=dpi)
+
+        # 2. Generate street network image (array)
+        # For overlay plume, reuse basemap_img and emission_source
+        extent_range = radius
+        size_in_pixels = int((2 * extent_range) / dxy)
+
+        # 3. Run plume model and overlay
+        fig_overlay, min_conc, max_conc = run_dispersion_model_local(
+            longitude, latitude, basemap_img,
+            emission_source_x, emission_source_y, flow_rate, H, T_stack, None, extent_range, size_in_pixels
+        )
+        overlay_path = "/tmp/plume.png"
+        fig_overlay.savefig(overlay_path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
         plt.close(fig_overlay)
-        return send_file(buf, mimetype='image/png', as_attachment=False, download_name='ModelDispersie.png')
+
+        # Encode images for inline display
+        def encode_img(path):
+            with open(path, "rb") as imgfile:
+                return base64.b64encode(imgfile.read()).decode()
+        basemap_b64 = encode_img(basemap_path)
+        overlay_b64 = encode_img(overlay_path)
+
+        # Metadate
+        metadate = {
+            "Data generării": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "Coordonate centru": f"({latitude}, {longitude})",
+            "Rază analiză": f"{radius} m",
+            "Flow rate": f"{flow_rate} m³/s",
+            "Înălțime sursă": f"{H} m",
+            "Temperatură gaze": f"{T_stack} °C",
+            "Grid step": f"{dxy} m",
+            "Emission source (x,y)": f"({emission_source_x:.2f}, {emission_source_y:.2f})",
+            "Max conc": f"{max_conc:.2f} μg/m³",
+            "Min conc (>0)": f"{min_conc:.2f} μg/m³"
+        }
+
+        html = f"""
+        <h2>Rezultat simulare dispersie</h2>
+        <b>Basemap + rețea stradală</b><br>
+        <img src='data:image/png;base64,{basemap_b64}' style='max-width:480px;'/><br>
+        <b>Plume suprapus pe hartă</b><br>
+        <img src='data:image/png;base64,{overlay_b64}' style='max-width:480px;'/><br>
+        <h3>Metadate simulare</h3>
+        <ul>
+        {''.join([f'<li><b>{k}</b>: {v}</li>' for k, v in metadate.items()])}
+        </ul>
+        <a href='/'>⟵ Înapoi la simulare</a>
+        """
+        return render_template_string(html)
+
     except Exception as e:
         return f"Error during simulation: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5003, debug=True)
