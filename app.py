@@ -1,10 +1,10 @@
-import matplotlib
-matplotlib.use('Agg')  # Backend non-GUI pentru Matplotlib
-
-from flask import Flask, request, render_template_string
-import io
+import os
+from dotenv import load_dotenv
+from flask import Flask, request, render_template_string, send_file
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import osmnx as ox
@@ -12,76 +12,26 @@ import contextily as ctx
 from tqdm import tqdm
 import base64
 from datetime import datetime
+from pyngrok import ngrok
+import threading
+
+load_dotenv()
 
 app = Flask(__name__)
 
-##############################
-# Hartă cu străzi + basemap color (pentru primul card)
-##############################
-def generate_network_basemap(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
-    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
-    node_id = ox.nearest_nodes(G, center_lon, center_lat)
-    G_proj = ox.project_graph(G)
-    crs_proj = G_proj.graph['crs']
-    emission_source_x = G_proj.nodes[node_id]['x']
-    emission_source_y = G_proj.nodes[node_id]['y']
-    extent_range = dist
-    size_in_pixels = int((2 * extent_range) / dxy)
-    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
-    fig, ax = ox.plot_graph(
-        G_proj, bgcolor='none', edge_color='#003366', node_size=0,
-        edge_linewidth=0.5, show=False, close=False, figsize=figsize
-    )
-    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
-    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
-    # Adaugă basemap color
-    try:
-        ctx.add_basemap(ax, crs=crs_proj, source=ctx.providers.Stamen.Terrain)
-    except Exception:
-        pass
-    fig.tight_layout(pad=0)
-    fig.canvas.draw()
-    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
-    # Salvează imaginea ca png
-    path = "/tmp/network_basemap.png"
-    fig.savefig(path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
-    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels, path
+# =======================
+# Utilitare model dispersie
+# =======================
 
-##############################
-# Hartă doar cu străzi pentru suprapunerea plumei
-##############################
-def generate_network_only(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
-    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
-    node_id = ox.nearest_nodes(G, center_lon, center_lat)
-    G_proj = ox.project_graph(G)
-    crs_proj = G_proj.graph['crs']
-    emission_source_x = G_proj.nodes[node_id]['x']
-    emission_source_y = G_proj.nodes[node_id]['y']
-    extent_range = dist
-    size_in_pixels = int((2 * extent_range) / dxy)
-    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
-    fig, ax = ox.plot_graph(
-        G_proj, bgcolor='white', edge_color='#003366', node_size=0,
-        edge_linewidth=0.5, show=False, close=False, figsize=figsize
-    )
-    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
-    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
-    fig.tight_layout(pad=0)
-    fig.canvas.draw()
-    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
-    plt.close(fig)
-    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels
-
-##############################
-# Gaussian Plume & Heatmap
-##############################
 def calc_sigmas(CATEGORY, x1):
     x = np.abs(x1)
     a = np.zeros(np.shape(x))
     b = np.zeros(np.shape(x))
     c = np.zeros(np.shape(x))
     d = np.zeros(np.shape(x))
+    # ... (același cod ca în exemplul tău, vezi mai sus pentru toate categoriile) ...
+    # (codul pentru fiecare categorie, vezi mesajul anterior pentru detalii)
+    # [cod complet identic cu versiunea precedentă]
     if CATEGORY == 1:
         ind = np.where((x < 100.) & (x > 0.)); a[ind] = 122.800; b[ind] = 0.94470
         ind = np.where((x >= 100.) & (x < 150.)); a[ind] = 158.080; b[ind] = 1.05420
@@ -93,6 +43,8 @@ def calc_sigmas(CATEGORY, x1):
         ind = np.where((x >= 500.) & (x < 3110.)); a[ind] = 453.85; b[ind] = 2.1166
         ind = np.where(x >= 3110.); a[ind] = 453.85; b[ind] = 2.1166
         c[:] = 24.1670; d[:] = 2.5334
+    # (continuă cu categoriile 2-6, exact ca în codul tău)
+    # ... codul complet calc_sigmas (sau cere-l explicit dacă vrei tot)
     elif CATEGORY == 2:
         ind = np.where((x < 200.) & (x > 0.)); a[ind] = 90.673; b[ind] = 0.93198
         ind = np.where((x >= 200.) & (x < 400.)); a[ind] = 98.483; b[ind] = 0.98332
@@ -153,17 +105,17 @@ def gauss_func(Q, u, dir1, x, y, z, xs, ys, H_eff, Dy, Dz, STABILITY):
     sig_y, sig_z = calc_sigmas(STABILITY, downwind)
     C = np.zeros(x.shape)
     ind = downwind > 0
-    exp_part = np.exp(-crosswind[ind]**2 / (2 * sig_y[ind]**2))
-    exp_z = (np.exp(- (z[ind] - H_eff)**2 / (2 * sig_z[ind]**2)) +
-             np.exp(- (z[ind] + H_eff)**2 / (2 * sig_z[ind]**2)))
-    C[ind] = Q / (2 * np.pi * u1 * sig_y[ind] * sig_z[ind]) * exp_part * exp_z
+    exp_part = np.exp(-crosswind[ind]**2 / (2 * sig_y[ind]**2 + 1e-15))
+    exp_z = (np.exp(- (z[ind] - H_eff)**2 / (2 * sig_z[ind]**2 + 1e-15)) +
+             np.exp(- (z[ind] + H_eff)**2 / (2 * sig_z[ind]**2 + 1e-15)))
+    C[ind] = Q / (2 * np.pi * u1 * sig_y[ind] * sig_z[ind] + 1e-15) * exp_part * exp_z
     return C
 
 def calculate_plume_rise(T_stack, T_ambient, wind_speed, flow_rate, stack_diameter=0.5):
     T_stack_K = T_stack + 273.15
     T_ambient_K = T_ambient + 273.15
     delta_T = T_stack_K - T_ambient_K
-    delta_H = stack_diameter * (flow_rate / wind_speed)**0.25 * (1 + (delta_T / T_stack_K))
+    delta_H = stack_diameter * (flow_rate / (wind_speed + 1e-15))**0.25 * (1 + (delta_T / (T_stack_K + 1e-15)))
     return delta_H
 
 def estimate_stability(row):
@@ -206,7 +158,6 @@ def overlay_on_map(local_x, local_y, C1, image_data, extent_range):
     ax.set_title('Dispersion Plume Overlaid on Local Street Map')
     ax.legend(loc='upper right')
     fig.tight_layout()
-    # Return also C1_max, min/max values for metadate
     return fig, C1_max, min_val, max_val
 
 def run_dispersion_model_local(center_lon, center_lat, street_network_image,
@@ -247,9 +198,131 @@ def run_dispersion_model_local(center_lon, center_lat, street_network_image,
     fig_overlay, C1_max, min_conc, max_conc = overlay_on_map(local_x, local_y, C1, street_network_image, extent_range)
     return fig_overlay, min_conc, max_conc
 
-# --------------------------
-# Flask Routes & Interface
-# --------------------------
+# ======================
+# Funcții de generare hartă (ai deja)
+# ======================
+
+# def generate_network_basemap(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+#     G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+#     node_id = ox.nearest_nodes(G, center_lon, center_lat)
+#     G_proj = ox.project_graph(G)
+#     crs_proj = G_proj.graph['crs']
+#     emission_source_x = G_proj.nodes[node_id]['x']
+#     emission_source_y = G_proj.nodes[node_id]['y']
+#     extent_range = dist
+#     size_in_pixels = int((2 * extent_range) / dxy)
+#     figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+#     fig, ax = ox.plot_graph(
+#         G_proj, bgcolor='none', edge_color='#003366', node_size=0,
+#         edge_linewidth=0.5, show=False, close=False, figsize=figsize
+#     )
+#     ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
+#     ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
+#     try:
+#         ctx.add_basemap(ax, crs=crs_proj, source=ctx.providers.Stamen.Terrain)
+#     except Exception:
+#         pass
+#     fig.tight_layout(pad=0)
+#     fig.canvas.draw()
+#     image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+#     path = "/tmp/network_basemap.png"
+#     fig.savefig(path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
+#     plt.close(fig)
+#     return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels, path
+
+# def generate_network_only(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+#     G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+#     node_id = ox.nearest_nodes(G, center_lon, center_lat)
+#     G_proj = ox.project_graph(G)
+#     crs_proj = G_proj.graph['crs']
+#     emission_source_x = G_proj.nodes[node_id]['x']
+#     emission_source_y = G_proj.nodes[node_id]['y']
+#     extent_range = dist
+#     size_in_pixels = int((2 * extent_range) / dxy)
+#     figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+#     fig, ax = ox.plot_graph(
+#         G_proj, bgcolor='white', edge_color='#003366', node_size=0,
+#         edge_linewidth=0.5, show=False, close=False, figsize=figsize
+#     )
+#     ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
+#     ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
+#     fig.tight_layout(pad=0)
+#     fig.canvas.draw()
+#     image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+#     plt.close(fig)
+#     return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels
+
+def generate_network_basemap(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+    import pyproj
+
+    # Proiecție EPSG:3857
+    crs_3857 = "EPSG:3857"
+
+    # Creează graful și proiectează în EPSG:3857
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+    G_proj = ox.project_graph(G, to_crs=crs_3857)
+    crs_proj = G_proj.graph['crs']
+
+    # Coordonate sursă în EPSG:4326 -> EPSG:3857
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs_3857, always_xy=True)
+    emission_source_x, emission_source_y = transformer.transform(center_lon, center_lat)
+
+    extent_range = dist
+    size_in_pixels = int((2 * extent_range) / dxy)
+    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+
+    fig, ax = ox.plot_graph(
+        G_proj, bgcolor='none', edge_color='#003366', node_size=0,
+        edge_linewidth=0.5, show=False, close=False, figsize=figsize
+    )
+    # Limitele axei în EPSG:3857
+    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
+    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
+
+    # Adaugă basemap color, neapărat cu reset_extent=True!
+    try:
+        ctx.add_basemap(
+            ax, crs=crs_proj, source=ctx.providers.Stamen.Terrain,
+            zoom=15, reset_extent=False  # Păstrează exact axa setată mai sus!
+        )
+    except Exception as e:
+        print(f"Eroare la contextily: {e}")
+
+    fig.tight_layout(pad=0)
+    fig.canvas.draw()
+    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+    path = "/tmp/network_basemap.png"
+    fig.savefig(path, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels, path
+
+
+def generate_network_only(center_lat, center_lon, dist=2500, dxy=10, dpi=100):
+    G = ox.graph_from_point((center_lat, center_lon), dist=dist, network_type='drive')
+    node_id = ox.nearest_nodes(G, center_lon, center_lat)
+    G_proj = ox.project_graph(G, to_crs="EPSG:3857")
+    crs_proj = G_proj.graph['crs']
+    emission_source_x = G_proj.nodes[node_id]['x']
+    emission_source_y = G_proj.nodes[node_id]['y']
+    extent_range = dist
+    size_in_pixels = int((2 * extent_range) / dxy)
+    figsize = (size_in_pixels / dpi, size_in_pixels / dpi)
+    fig, ax = ox.plot_graph(
+        G_proj, bgcolor='white', edge_color='#003366', node_size=0,
+        edge_linewidth=0.5, show=False, close=False, figsize=figsize
+    )
+    ax.set_xlim([emission_source_x - extent_range, emission_source_x + extent_range])
+    ax.set_ylim([emission_source_y - extent_range, emission_source_y + extent_range])
+    fig.tight_layout(pad=0)
+    fig.canvas.draw()
+    image_array = np.array(fig.canvas.renderer._renderer)[..., :3]
+    plt.close(fig)
+    return image_array, emission_source_x, emission_source_y, crs_proj, extent_range, size_in_pixels
+
+
+# =====================
+# Flask routes & Template
+# =====================
 
 form_template = """
 <!DOCTYPE html>
@@ -418,8 +491,6 @@ def simulate():
         """
         return render_template_string(html)
 
-# Rute pentru imagini mari (click zoom)
-from flask import send_file
 @app.route("/image/network")
 def img_network():
     return send_file("/tmp/last_network.png", mimetype="image/png")
@@ -428,5 +499,33 @@ def img_network():
 def img_overlay():
     return send_file("/tmp/last_overlay.png", mimetype="image/png")
 
+# ====================
+# Pornire Flask + ngrok
+# ====================
+def run_with_ngrok(app, port=5008):
+    ngrok_token = os.getenv("NGROK_TOKEN")
+    ngrok_hostname = os.getenv("NGROK_HOSTNAME")
+    if ngrok_token:
+        ngrok.set_auth_token(ngrok_token)
+        try:
+            if ngrok_hostname:
+                public_url = ngrok.connect(port, hostname=ngrok_hostname)
+            else:
+                public_url = ngrok.connect(port)
+        except Exception as e:
+            print("Eroare la conectarea cu hostname static:", e)
+            public_url = ngrok.connect(port)
+        print(f"\n*** LINK STATIC NGROK: {public_url.public_url}\n")
+    else:
+        print("Warning: nu ai setat token ngrok. Aplicația va fi disponibilă doar local.")
+
+    def run_flask():
+        app.run(host='0.0.0.0', port=port, debug=False)
+
+    thread = threading.Thread(target=run_flask)
+    thread.daemon = True
+    thread.start()
+    thread.join()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5003, debug=True)
+    run_with_ngrok(app, port=5009)
